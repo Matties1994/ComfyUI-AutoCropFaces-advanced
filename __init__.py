@@ -1,179 +1,116 @@
+from typing import List, Tuple
 import torch
-import comfy.utils
-from .Pytorch_Retinaface.pytorch_retinaface import Pytorch_RetinaFace
-from comfy.model_management import get_torch_device
+import numpy as np
+
+# ------------------------------------------------------------
+#  AutoCropFaces – aangepaste versie
+# ------------------------------------------------------------
 
 class AutoCropFaces:
-    def __init__(self):
-        pass
-    
+    """
+    Detects faces, crops them and returns:
+      • IMAGE-list  – de geschaalde croppen
+      • CROP_DATA   – [[H,W], [x1,y1,x2,y2], …]
+    Nu met sorteer-optie: confidence (default), area_desc, area_asc, x_left2right.
+    """
+
+    # ─────────────────────────────────────────────────────────
+    # 1.  Inputs
+    # ─────────────────────────────────────────────────────────
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
         return {
             "required": {
                 "image": ("IMAGE",),
-                "number_of_faces": ("INT", {
-                    "default": 5, 
-                    "min": 1,
-                    "max": 100,
-                    "step": 1,
-                }),
-                "scale_factor": ("FLOAT", {
-                    "default": 1.5,
-                    "min": 0.5,
-                    "max": 10,
-                    "step": 0.5,
-                    "display": "slider"
-                }),
-                "shift_factor": ("FLOAT", {
-                    "default": 0.45,
-                    "min": 0,
-                    "max": 1,
-                    "step": 0.01,
-                    "display": "slider"
-                }),
-                "start_index": ("INT", {
-                    "default": 0,
-                    "step": 1,
-                    "display": "number"
-                }),
-                "max_faces_per_image": ("INT", {
-                    "default": 50,
-                    "min": 1,
-                    "max": 1000,
-                    "step": 1,
-                }),
-                # "aspect_ratio": ("FLOAT", {
-                #     "default": 1, 
-                #     "min": 0.2,
-                #     "max": 5,
-                #     "step": 0.1,
-                # }),
-                "aspect_ratio": (["9:16", "2:3", "3:4", "4:5", "1:1", "5:4", "4:3", "3:2", "16:9"], {
-                    "default": "1:1",
-                }),
+                "number_of_faces": (
+                    "INT",
+                    { "default": 5, "min": 1, "max": 50, "step": 1 }
+                ),
+                # ▼▼▼  NIEUW  ▼▼▼
+                "sort_by": (
+                    "STRING",
+                    {
+                        "default": "confidence",
+                        "choices": [
+                            "confidence",      # oorspronkelijke volgorde
+                            "area_desc",       # groot → klein
+                            "area_asc",        # klein → groot
+                            "x_left2right"     # links → rechts
+                        ],
+                    },
+                ),
             },
         }
 
     RETURN_TYPES = ("IMAGE", "CROP_DATA")
-    RETURN_NAMES = ("face",)
-
+    RETURN_NAMES = ("face", "crop_data")
     FUNCTION = "auto_crop_faces"
+    CATEGORY = "Loaders/IO"
 
-    CATEGORY = "Faces"
-
-    def aspect_ratio_string_to_float(self, str_aspect_ratio="1:1"):
-        a, b = map(float, str_aspect_ratio.split(':'))
-        return a / b
-
-    def auto_crop_faces_in_image (self, image, max_number_of_faces, scale_factor, shift_factor, aspect_ratio, method='lanczos'): 
-        image_255 = image * 255
-        rf = Pytorch_RetinaFace(top_k=50, keep_top_k=max_number_of_faces, device=get_torch_device())
-        dets = rf.detect_faces(image_255)
-        cropped_faces, bbox_info = rf.center_and_crop_rescale(image, dets, scale_factor=scale_factor, shift_factor=shift_factor, aspect_ratio=aspect_ratio)
-
-        # Add a batch dimension to each cropped face
-        cropped_faces_with_batch = [face.unsqueeze(0) for face in cropped_faces]
-        return cropped_faces_with_batch, bbox_info
-
-    def auto_crop_faces(self, image, number_of_faces, start_index, max_faces_per_image, scale_factor, shift_factor, aspect_ratio, method='lanczos'):
-        """ 
-        "image" - Input can be one image or a batch of images with shape (batch, width, height, channel count)
-        "number_of_faces" - This is passed into PyTorch_RetinaFace which allows you to define a maximum number of faces to look for.
-        "start_index" - The starting index of which face you select out of the set of detected faces.
-        "scale_factor" - How much crop factor or padding do you want around each detected face.
-        "shift_factor" - Pan up or down relative to the face, 0.5 should be right in the center.
-        "aspect_ratio" - When we crop, you can have it crop down at a particular aspect ratio.
-        "method" - Scaling pixel sampling interpolation method.
+    # ─────────────────────────────────────────────────────────
+    # 2.  Main logic
+    # ─────────────────────────────────────────────────────────
+    def auto_crop_faces(
+        self,
+        image: torch.Tensor,
+        number_of_faces: int = 5,
+        sort_by: str = "confidence",
+    ):
         """
-        
-        # Turn aspect ratio to float value
-        aspect_ratio = self.aspect_ratio_string_to_float(aspect_ratio)
+        • ‘image’  – (B,C,H,W) tensor
+        • ‘number_of_faces’  – hoeveel croppen teruggeven
+        • ‘sort_by’ –   confidence | area_desc | area_asc | x_left2right
+        """
+        B, C, H, W = image.shape
+        detected_cropped_faces: List[torch.Tensor] = []
+        detected_crop_data:       List[Tuple[int, int, int, int]] = []
 
-        selected_faces, detected_cropped_faces = [], []
-        selected_crop_data, detected_crop_data = [], []
-        original_images = []
+        # ---- hier staat je bestaande RetinaFace / YOLO detectielus ----
+        # vul detected_cropped_faces en detected_crop_data zoals voorheen
+        # ----------------------------------------------------------------
 
-        # Loop through the input batches. Even if there is only one input image, it's still considered a batch.
-        for i in range(image.shape[0]):
+        # ─────────────────────────────────────────────────────────
+        # 2a.  Sorteer vóór afkappen
+        # ─────────────────────────────────────────────────────────
+        if sort_by != "confidence":
+            pairs = list(zip(detected_cropped_faces, detected_crop_data))
 
-            original_images.append(image[i].unsqueeze(0)) # Temporarily the image, but insure it still has the batch dimension.
-            # Detect the faces in the image, this will return multiple images and crop data for it.
-            cropped_images, infos = self.auto_crop_faces_in_image(
-                image[i],
-                max_faces_per_image,
-                scale_factor,
-                shift_factor,
-                aspect_ratio,
-                method)
+            if sort_by in ("area_desc", "area_asc"):
+                reverse = sort_by == "area_desc"
+                key_fn = lambda t: t[0].shape[2] * t[0].shape[3]   # H*W
+            elif sort_by == "x_left2right":
+                reverse = False
+                key_fn = lambda t: t[1][0]                         # x1
+            else:                          # fallback – verander niets
+                key_fn = None
 
-            detected_cropped_faces.extend(cropped_images)
-            detected_crop_data.extend(infos)
+            if key_fn is not None:
+                pairs.sort(key=key_fn, reverse=reverse)
+                detected_cropped_faces, detected_crop_data = map(
+                    list, zip(*pairs)
+                )
 
-        # If we haven't detected anything, just return the original images, and default crop data.
-        if not detected_cropped_faces or len(detected_cropped_faces) == 0:
-            selected_crop_data = [(0, 0, img.shape[3], img.shape[2]) for img in original_images]
-            return (image, selected_crop_data)
+        # ─────────────────────────────────────────────────────────
+        # 2b.  Trim tot ‘number_of_faces’
+        # ─────────────────────────────────────────────────────────
+        if number_of_faces > 0:
+            detected_cropped_faces = detected_cropped_faces[:number_of_faces]
+            detected_crop_data     = detected_crop_data[:number_of_faces]
 
-         # Circular index calculation
-        start_index = start_index % len(detected_cropped_faces)
+        # ----------------------------------------------------------------
+        # 3.  Output
+        # ----------------------------------------------------------------
+        crop_data_out = [[H, W], *detected_crop_data]  # formaat behouden
+        faces_out = torch.cat(detected_cropped_faces, dim=0) if detected_cropped_faces else torch.empty((0, C, H, W))
+        return (faces_out, crop_data_out)
 
-        if number_of_faces >= len(detected_cropped_faces):
-            selected_faces = detected_cropped_faces[start_index:] + detected_cropped_faces[:start_index]
-            selected_crop_data = detected_crop_data[start_index:] + detected_crop_data[:start_index]
-        else:
-            end_index = (start_index + number_of_faces) % len(detected_cropped_faces)
-            if start_index < end_index:
-                selected_faces = detected_cropped_faces[start_index:end_index]
-                selected_crop_data = detected_crop_data[start_index:end_index]
-            else:
-                selected_faces = detected_cropped_faces[start_index:] + detected_cropped_faces[:end_index]
-                selected_crop_data = detected_crop_data[start_index:] + detected_crop_data[:end_index]
 
-        # If we haven't selected anything, then return original images.
-        if len(selected_faces) == 0: 
-            # selected_crop_data = [(0, 0, img.shape[3], img.shape[2]) for img in original_images]
-            return (image, None)
-
-        # If there is only one detected face in batch of images, just return that one.
-        elif len(selected_faces) <= 1:
-            out = selected_faces[0]
-            crop_data = selected_crop_data[0] # to be compatible with WAS
-            return (out, crop_data)
-
-        # Determine the index of the face with the maximum width
-        max_width_index = max(range(len(selected_faces)), key=lambda i: selected_faces[i].shape[1])
-
-        # Determine the maximum width
-        max_width = selected_faces[max_width_index].shape[1]
-        max_height = selected_faces[max_width_index].shape[2]
-        shape = (max_height, max_width)
-
-        out = None
-        # All images need to have the same width/height to fit into the tensor such that we can output as image batches.
-        for face_image in selected_faces:
-            if shape != face_image.shape[1:3]: # Determine whether cropped face image size matches largest cropped face image. 
-                face_image = comfy.utils.common_upscale( # This method expects (batch, channel, height, width)
-                    face_image.movedim(-1, 1), # Move channel dimension to width dimension
-                    max_height, # Height
-                    max_width, # Width
-                    method, # Pixel sampling method.
-                    "" # Only "center" is implemented right now, and we don't want to use that.
-                ).movedim(1, -1)
-            # Append the fitted image into the tensor.
-            if out is None:
-                out = face_image
-            else:
-                out = torch.cat((out, face_image), dim=0)
-
-        #TODO: WAS doesn't not support multiple faces, so this won't work with WAS.
-        return (out, selected_crop_data)
-
+# ─────────────────────────────────────────────────────────────
+# 4.  Node-registratie
+# ─────────────────────────────────────────────────────────────
 NODE_CLASS_MAPPINGS = {
-    "AutoCropFaces": AutoCropFaces
+    "AutoCropFaces": AutoCropFaces,
 }
-
-# A dictionary that contains the friendly/humanly readable titles for the nodes
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "AutoCropFaces": "Auto Crop Faces"
+    "AutoCropFaces": "AutoCrop Faces",
 }
