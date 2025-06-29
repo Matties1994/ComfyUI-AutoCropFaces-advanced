@@ -8,14 +8,12 @@ class AutoCropFaces:
     # ───────────────────────────────────────────────────────────── INPUT TYPES ──
     @classmethod
     def INPUT_TYPES(cls):
-        """
-        Adds a new dropdown: `face_filter`
-        """
+        """Add dropdown 'face_filter' to choose sort order."""
         return {
             "required": {
                 "image": ("IMAGE",),
 
-                # how many faces to output
+                # number of faces to output
                 "number_of_faces": (
                     "INT",
                     {"default": 5, "min": 1, "max": 100, "step": 1},
@@ -43,10 +41,10 @@ class AutoCropFaces:
                     },
                 ),
 
-                # position in ordered list (circular)
+                # start position in ordered list (circular)
                 "start_index": ("INT", {"default": 0, "step": 1, "display": "number"}),
 
-                # maximum faces to *detect* per image
+                # max faces to *detect* per image
                 "max_faces_per_image": (
                     "INT",
                     {"default": 50, "min": 1, "max": 1000, "step": 1},
@@ -68,8 +66,7 @@ class AutoCropFaces:
                     {"default": "1:1"},
                 ),
 
-                # ── NEW ──
-                # how to order faces before selecting them
+                # ── NEW ── how to sort faces before selection
                 "face_filter": (
                     ["largest_first", "smallest_first", "left_to_right"],
                     {"default": "largest_first"},
@@ -100,14 +97,14 @@ class AutoCropFaces:
         """
         Run RetinaFace on a single image tensor and return:
         • list[cropped_face_tensor]
-        • list[bbox]  (x0, y0, x1, y1)
+        • list[tuple]  (cx, cy, scale) — centre-X, centre-Y, size factor
         """
         img_255 = img_tensor * 255
         rf = Pytorch_RetinaFace(
             top_k=50, keep_top_k=max_faces, device=get_torch_device()
         )
         detections = rf.detect_faces(img_255)
-        crops, bboxes = rf.center_and_crop_rescale(
+        crops, infos = rf.center_and_crop_rescale(
             img_tensor,
             detections,
             scale_factor=scale,
@@ -116,7 +113,7 @@ class AutoCropFaces:
         )
         # ensure batch-dim
         crops = [c.unsqueeze(0) for c in crops]
-        return crops, bboxes
+        return crops, infos
 
     # ────────────────────────────────────────────────────────────── MAIN ──
     def auto_crop_faces(
@@ -133,21 +130,16 @@ class AutoCropFaces:
     ):
         """
         Detect faces, order them according to *face_filter*,
-        then output `number_of_faces` starting at `start_index`.
-
-        face_filter:
-            • largest_first   – descending by bbox area
-            • smallest_first  – ascending by bbox area
-            • left_to_right   – ascending x₀ coordinate
+        then return `number_of_faces` starting at `start_index`.
         """
 
         aspect_ratio_f = self._aspect_ratio_to_float(aspect_ratio)
 
-        detected_faces, detected_bboxes = [], []
+        detected_faces, detected_infos = [], []
 
         # iterate over batch
         for i in range(image.shape[0]):
-            crops, bboxes = self._detect_and_crop(
+            crops, infos = self._detect_and_crop(
                 image[i],
                 max_faces_per_image,
                 scale_factor,
@@ -156,61 +148,56 @@ class AutoCropFaces:
                 method,
             )
             detected_faces.extend(crops)
-            detected_bboxes.extend(bboxes)
+            detected_infos.extend(infos)
 
-        # nothing detected → return original image(s)
+        # nothing detected → pass-through
         if not detected_faces:
-            fallback_crop = [
-                (0, 0, img.shape[3], img.shape[2]) for img in image.unsqueeze(0)
-            ]
-            return image, fallback_crop
+            fallback = [(0, 0, image.shape[3], image.shape[2])]  # dummy crop
+            return image, fallback
 
         # ── ORDER / FILTER ───────────────────────────────────────────────
         if face_filter == "largest_first":
             order = sorted(
                 range(len(detected_faces)),
-                key=lambda i: (
-                    detected_bboxes[i][2] - detected_bboxes[i][0]
-                )  # width  (x1-x0)
-                * (detected_bboxes[i][3] - detected_bboxes[i][1]),  # height (y1-y0)
+                key=lambda i: detected_faces[i].shape[1]  # width
+                * detected_faces[i].shape[2],  # height
                 reverse=True,
             )
         elif face_filter == "smallest_first":
             order = sorted(
                 range(len(detected_faces)),
-                key=lambda i: (
-                    detected_bboxes[i][2] - detected_bboxes[i][0]
-                )  # width
-                * (detected_bboxes[i][3] - detected_bboxes[i][1]),
+                key=lambda i: detected_faces[i].shape[1]
+                * detected_faces[i].shape[2],
             )
         else:  # "left_to_right"
-            order = sorted(range(len(detected_faces)), key=lambda i: detected_bboxes[i][0])
+            # infos[0] is centre-x for every face tuple
+            order = sorted(range(len(detected_faces)), key=lambda i: detected_infos[i][0])
 
         detected_faces = [detected_faces[i] for i in order]
-        detected_bboxes = [detected_bboxes[i] for i in order]
+        detected_infos = [detected_infos[i] for i in order]
 
         # ── SELECT SUBSET (circular slice) ───────────────────────────────
         start_index %= len(detected_faces)
 
         if number_of_faces >= len(detected_faces):
             faces_sel = detected_faces[start_index:] + detected_faces[:start_index]
-            bbox_sel = detected_bboxes[start_index:] + detected_bboxes[:start_index]
+            infos_sel = detected_infos[start_index:] + detected_infos[:start_index]
         else:
             end = (start_index + number_of_faces) % len(detected_faces)
             if start_index < end:
                 faces_sel = detected_faces[start_index:end]
-                bbox_sel = detected_bboxes[start_index:end]
+                infos_sel = detected_infos[start_index:end]
             else:
                 faces_sel = detected_faces[start_index:] + detected_faces[:end]
-                bbox_sel = detected_bboxes[start_index:] + detected_bboxes[:end]
+                infos_sel = detected_infos[start_index:] + detected_infos[:end]
 
         # ── PREPARE OUTPUT ───────────────────────────────────────────────
         if not faces_sel:
             return image, None
         if len(faces_sel) == 1:
-            return faces_sel[0], bbox_sel[0]
+            return faces_sel[0], infos_sel[0]
 
-        # pad / upscale to a common size
+        # pad / upscale to common size
         max_w = max(f.shape[1] for f in faces_sel)
         max_h = max(f.shape[2] for f in faces_sel)
 
@@ -226,7 +213,7 @@ class AutoCropFaces:
                 ).movedim(1, -1)
             out = f if out is None else torch.cat((out, f), dim=0)
 
-        return out, bbox_sel
+        return out, infos_sel
 
 
 # ────────────────────────────────────────────────────────── NODE REGISTRY ──
