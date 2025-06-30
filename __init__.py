@@ -25,7 +25,7 @@ class AutoCropFaces:
                     {
                         "default": 1.5,
                         "min": 0.5,
-                        "max": 10,
+                        "max": 20,
                         "step": 0.5,
                         "display": "slider",
                     },
