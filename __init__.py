@@ -1,14 +1,24 @@
 import torch
+import torchvision.ops as ops  # NMS voor duplicate filtering
 import comfy.utils
 from .Pytorch_Retinaface.pytorch_retinaface import Pytorch_RetinaFace
 from comfy.model_management import get_torch_device
 
 
 class AutoCropFaces:
+    """Detecteert gezichten, filtert duplicaten met NMS, sorteert en crop.
+    
+    *Nieuw*
+    --------
+    - **NMS** (Non‑Maximum Suppression) in `_detect_and_crop` voorkomt dat hetzelfde
+      gezicht meerdere keren wordt doorgegeven.
+    - Parameter `face_filter` bepaalt volgorde (grootste, kleinste, links‑naar‑rechts).
+    """
+
     # ───────────────────────────────────────────────────────────── INPUT TYPES ──
     @classmethod
     def INPUT_TYPES(cls):
-        """Add dropdown 'face_filter' to choose sort order."""
+        """Definieert gui‑inputs, incl. dropdown 'face_filter'."""
         return {
             "required": {
                 "image": ("IMAGE",),
@@ -50,7 +60,7 @@ class AutoCropFaces:
                     {"default": 50, "min": 1, "max": 1000, "step": 1},
                 ),
 
-                # output aspect-ratio
+                # output aspect‑ratio
                 "aspect_ratio": (
                     [
                         "9:16",
@@ -87,23 +97,35 @@ class AutoCropFaces:
 
     def _detect_and_crop(
         self,
-        img_tensor,
-        max_faces,
-        scale,
-        shift,
-        aspect_ratio_float,
-        method="lanczos",
+        img_tensor: torch.Tensor,
+        max_faces: int,
+        scale: float,
+        shift: float,
+        aspect_ratio_float: float,
+        method: str = "lanczos",
+        nms_iou: float = 0.50,
     ):
+        """Run RetinaFace, filter duplicaten met NMS en crop.
+
+        Retourneert een tuple:
+        - list[cropped_face_tensor]
+        - list[tuple]  (cx, cy, scale)
         """
-        Run RetinaFace on a single image tensor and return:
-        • list[cropped_face_tensor]
-        • list[tuple]  (cx, cy, scale) — centre-X, centre-Y, size factor
-        """
+        # RetinaFace verwacht [0‑255] range
         img_255 = img_tensor * 255
-        rf = Pytorch_RetinaFace(
-            top_k=50, keep_top_k=max_faces, device=get_torch_device()
-        )
-        detections = rf.detect_faces(img_255)
+        rf = Pytorch_RetinaFace(top_k=50, keep_top_k=max_faces, device=get_torch_device())
+
+        # ── 1. Detectie ────────────────────────────────────────────────
+        detections = rf.detect_faces(img_255)  # Tensor (N, 15)
+
+        # ── 2. Duplicate‑filter met NMS ───────────────────────────────
+        if detections.numel():  # alleen als er iets gedetecteerd is
+            boxes = detections[:, :4]   # (x1, y1, x2, y2)
+            scores = detections[:, 4]   # confidence
+            keep = ops.nms(boxes, scores, nms_iou)
+            detections = detections[keep]
+
+        # ── 3. Croppen & rescalen ─────────────────────────────────────
         crops, infos = rf.center_and_crop_rescale(
             img_tensor,
             detections,
@@ -111,33 +133,31 @@ class AutoCropFaces:
             shift_factor=shift,
             aspect_ratio=aspect_ratio_float,
         )
-        # ensure batch-dim
+
+        # Zorg dat batch‑dim aanwezig is
         crops = [c.unsqueeze(0) for c in crops]
         return crops, infos
 
     # ────────────────────────────────────────────────────────────── MAIN ──
     def auto_crop_faces(
         self,
-        image,
-        number_of_faces,
-        start_index,
-        max_faces_per_image,
-        scale_factor,
-        shift_factor,
-        aspect_ratio,
-        face_filter,  # new parameter
-        method="lanczos",
+        image: torch.Tensor,
+        number_of_faces: int,
+        start_index: int,
+        max_faces_per_image: int,
+        scale_factor: float,
+        shift_factor: float,
+        aspect_ratio: str,
+        face_filter: str,  # new parameter
+        method: str = "lanczos",
     ):
-        """
-        Detect faces, order them according to *face_filter*,
-        then return `number_of_faces` starting at `start_index`.
-        """
+        """Detect faces, order via *face_filter*, dedup via NMS, return subset."""
 
         aspect_ratio_f = self._aspect_ratio_to_float(aspect_ratio)
 
         detected_faces, detected_infos = [], []
 
-        # iterate over batch
+        # ── Detectie per batch‑frame ───────────────────────────────────
         for i in range(image.shape[0]):
             crops, infos = self._detect_and_crop(
                 image[i],
@@ -150,33 +170,30 @@ class AutoCropFaces:
             detected_faces.extend(crops)
             detected_infos.extend(infos)
 
-        # nothing detected → pass-through
+        # ── Niets gevonden → passthrough ──────────────────────────────
         if not detected_faces:
             fallback = [(0, 0, image.shape[3], image.shape[2])]  # dummy crop
             return image, fallback
 
-        # ── ORDER / FILTER ───────────────────────────────────────────────
+        # ── ORDER / FILTER ────────────────────────────────────────────
         if face_filter == "largest_first":
             order = sorted(
                 range(len(detected_faces)),
-                key=lambda i: detected_faces[i].shape[1]  # width
-                * detected_faces[i].shape[2],  # height
+                key=lambda i: detected_faces[i].shape[1] * detected_faces[i].shape[2],
                 reverse=True,
             )
         elif face_filter == "smallest_first":
             order = sorted(
                 range(len(detected_faces)),
-                key=lambda i: detected_faces[i].shape[1]
-                * detected_faces[i].shape[2],
+                key=lambda i: detected_faces[i].shape[1] * detected_faces[i].shape[2],
             )
         else:  # "left_to_right"
-            # infos[0] is centre-x for every face tuple
             order = sorted(range(len(detected_faces)), key=lambda i: detected_infos[i][0])
 
         detected_faces = [detected_faces[i] for i in order]
         detected_infos = [detected_infos[i] for i in order]
 
-        # ── SELECT SUBSET (circular slice) ───────────────────────────────
+        # ── SELECT SUBSET (circular slice) ────────────────────────────
         start_index %= len(detected_faces)
 
         if number_of_faces >= len(detected_faces):
@@ -191,13 +208,13 @@ class AutoCropFaces:
                 faces_sel = detected_faces[start_index:] + detected_faces[:end]
                 infos_sel = detected_infos[start_index:] + detected_infos[:end]
 
-        # ── PREPARE OUTPUT ───────────────────────────────────────────────
+        # ── PREPARE OUTPUT ───────────────────────────────────────────
         if not faces_sel:
             return image, None
         if len(faces_sel) == 1:
             return faces_sel[0], infos_sel[0]
 
-        # pad / upscale to common size
+        # Pad / upscale naar gelijke resolutie
         max_w = max(f.shape[1] for f in faces_sel)
         max_h = max(f.shape[2] for f in faces_sel)
 
