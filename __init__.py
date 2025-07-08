@@ -85,6 +85,52 @@ class AutoCropFaces:
         a, b = map(float, ratio_str.split(":"))
         return a / b
 
+    @staticmethod
+    def _calculate_iou(box1, box2):
+        """
+        Calculate Intersection over Union (IoU) for two bounding boxes.
+        Boxes are expected to be in [x1, y1, x2, y2] format.
+        """
+        x1_inter = max(box1[0], box2[0])
+        y1_inter = max(box1[1], box2[1])
+        x2_inter = min(box1[2], box2[2])
+        y2_inter = min(box1[3], box2[3])
+
+        inter_area = max(0, x2_inter - x1_inter) * max(0, y2_inter - y1_inter)
+
+        box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
+
+        union_area = box1_area + box2_area - inter_area
+
+        if union_area == 0:
+            return 0.0
+
+        iou = inter_area / union_area
+        return iou
+
+    def _filter_duplicate_detections(self, detected_faces, detected_infos, raw_boxes, iou_threshold=0.85):
+        if not detected_faces:
+            return [], [], []
+
+        unique_faces = []
+        unique_infos = []
+        unique_raw_boxes = []
+
+        for i in range(len(raw_boxes)):
+            is_duplicate = False
+            for unique_box in unique_raw_boxes:
+                if self._calculate_iou(raw_boxes[i], unique_box) > iou_threshold:
+                    is_duplicate = True
+                    break
+
+            if not is_duplicate:
+                unique_faces.append(detected_faces[i])
+                unique_infos.append(detected_infos[i])
+                unique_raw_boxes.append(raw_boxes[i])
+
+        return unique_faces, unique_infos, unique_raw_boxes
+
     def _detect_and_crop(
         self,
         img_tensor,
@@ -99,21 +145,49 @@ class AutoCropFaces:
         • list[cropped_face_tensor]
         • list[tuple]  (cx, cy, scale) — centre-X, centre-Y, size factor
         """
+        Run RetinaFace on a single image tensor and return:
+        • list[cropped_face_tensor]
+        • list[tuple]  (cx, cy, scale) — centre-X, centre-Y, size factor
+        • list[list] raw_detections [x1, y1, x2, y2, (confidence)]
+        """
         img_255 = img_tensor * 255
         rf = Pytorch_RetinaFace(
             top_k=50, keep_top_k=max_faces, device=get_torch_device()
         )
-        detections = rf.detect_faces(img_255)
+        # detections_from_rf is a list of lists, e.g., [[x1,y1,x2,y2,conf], ...] or None
+        detections_from_rf = rf.detect_faces(img_255)
+
+        valid_detections_for_crop = []
+        raw_bounding_boxes = [] # To store just the bbox for duplicate checking
+
+        if detections_from_rf is not None:
+            for det in detections_from_rf:
+                if isinstance(det, (list, tuple)) and len(det) >= 4:
+                    # Pytorch_RetinaFace.detect_faces returns [x1,y1,x2,y2,confidence]
+                    # center_and_crop_rescale expects a list of such detections
+                    valid_detections_for_crop.append(det)
+                    raw_bounding_boxes.append(list(det[:4])) # Store [x1,y1,x2,y2] for duplicate check
+                # else:
+                    # print(f"Debug: Skipping invalid detection format: {det}")
+
+        if not valid_detections_for_crop:
+            # print("Debug: No valid detections found by _detect_and_crop.")
+            return [], [], []
+
+        # Pass all valid detections (including confidence) to center_and_crop_rescale
         crops, infos = rf.center_and_crop_rescale(
             img_tensor,
-            detections,
+            valid_detections_for_crop,
             scale_factor=scale,
             shift_factor=shift,
             aspect_ratio=aspect_ratio_float,
         )
-        # ensure batch-dim
-        crops = [c.unsqueeze(0) for c in crops]
-        return crops, infos
+
+        # ensure batch-dim for crops
+        processed_crops = [c.unsqueeze(0) for c in crops]
+
+        # Return processed_crops, their corresponding infos, and the raw_bounding_boxes that led to these crops
+        return processed_crops, infos, raw_bounding_boxes
 
     # ────────────────────────────────────────────────────────────── MAIN ──
     def auto_crop_faces(
@@ -135,11 +209,12 @@ class AutoCropFaces:
 
         aspect_ratio_f = self._aspect_ratio_to_float(aspect_ratio)
 
-        detected_faces, detected_infos = [], []
+        detected_faces, detected_infos, all_raw_boxes = [], [], []
 
         # iterate over batch
         for i in range(image.shape[0]):
-            crops, infos = self._detect_and_crop(
+            # _detect_and_crop now returns raw_bounding_boxes as the third item
+            crops, infos, raw_boxes = self._detect_and_crop(
                 image[i],
                 max_faces_per_image,
                 scale_factor,
@@ -147,15 +222,32 @@ class AutoCropFaces:
                 aspect_ratio_f,
                 method,
             )
-            detected_faces.extend(crops)
-            detected_infos.extend(infos)
+            if crops: # Only extend if detections were made
+                detected_faces.extend(crops)
+                detected_infos.extend(infos)
+                all_raw_boxes.extend(raw_boxes) # Collect raw bounding boxes
 
         # nothing detected → pass-through
         if not detected_faces:
+            # print("Debug: No faces detected in any image in the batch.")
             fallback = [(0, 0, image.shape[3], image.shape[2])]  # dummy crop
             return image, fallback
 
+        # Filter out duplicate detections
+        # print(f"Debug: Before filtering: {len(detected_faces)} faces, {len(all_raw_boxes)} boxes.")
+        detected_faces, detected_infos, all_raw_boxes = self._filter_duplicate_detections(
+            detected_faces, detected_infos, all_raw_boxes
+        )
+        # print(f"Debug: After filtering: {len(detected_faces)} faces.")
+
+        # if after filtering, no faces are left
+        if not detected_faces:
+            # print("Debug: No faces left after filtering duplicates.")
+            fallback = [(0, 0, image.shape[3], image.shape[2])]
+            return image, fallback
+
         # ── ORDER / FILTER ───────────────────────────────────────────────
+        # Ensure face_filter is applied to unique faces
         if face_filter == "largest_first":
             order = sorted(
                 range(len(detected_faces)),
@@ -206,10 +298,10 @@ class AutoCropFaces:
             if (f.shape[1], f.shape[2]) != (max_w, max_h):
                 f = comfy.utils.common_upscale(
                     f.movedim(-1, 1),  # (B,C,H,W)
-                    max_h,
-                    max_w,
+                    max_w, # target width
+                    max_h, # target height
                     method,
-                    "",
+                    "disabled", # crop parameter for comfy.utils.common_upscale
                 ).movedim(1, -1)
             out = f if out is None else torch.cat((out, f), dim=0)
 
