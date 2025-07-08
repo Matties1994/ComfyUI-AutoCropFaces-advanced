@@ -206,6 +206,13 @@ class AutoCropFaces:
         Detect faces, order them according to *face_filter*,
         then return `number_of_faces` starting at `start_index`.
         """
+        if image is None:
+            print("ERROR: AutoCropFaces node received no image input. Please check the workflow connections.")
+            # Return dummy outputs to prevent crash
+            # Expected return: IMAGE, CROP_DATA
+            # Create a small dummy tensor for the image output
+            dummy_image_tensor = torch.zeros((1, 64, 64, 3), dtype=torch.float32, device=get_torch_device())
+            return dummy_image_tensor, None
 
         aspect_ratio_f = self._aspect_ratio_to_float(aspect_ratio)
 
