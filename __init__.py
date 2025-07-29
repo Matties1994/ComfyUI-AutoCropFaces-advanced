@@ -66,10 +66,16 @@ class AutoCropFaces:
                     {"default": "1:1"},
                 ),
 
-                # ── NEW ── how to sort faces before selection
+                # how to sort faces before selection
                 "face_filter": (
                     ["largest_first", "smallest_first", "left_to_right"],
                     {"default": "largest_first"},
+                ),
+
+                # ── NEW ── filter faces based on size relative to the largest face
+                "min_size_percentage": (
+                    "INT",
+                    {"default": 0, "min": 0, "max": 100, "step": 1, "display": "slider"},
                 ),
             }
         }
@@ -125,11 +131,12 @@ class AutoCropFaces:
         scale_factor,
         shift_factor,
         aspect_ratio,
-        face_filter,  # new parameter
+        face_filter,
+        min_size_percentage, # new parameter
         method="lanczos",
     ):
         """
-        Detect faces, order them according to *face_filter*,
+        Detect faces, filter them by relative size, order them,
         then return `number_of_faces` starting at `start_index`.
         """
 
@@ -154,8 +161,23 @@ class AutoCropFaces:
         if not detected_faces:
             fallback = [(0, 0, image.shape[3], image.shape[2])]  # dummy crop
             return image, fallback
+        
+        # ── NEW: FILTER BY MINIMUM SIZE PERCENTAGE ───────────────────────────
+        if min_size_percentage > 0 and len(detected_faces) > 1:
+            # Calculate sizes (area) of all detected faces
+            sizes = [f.shape[1] * f.shape[2] for f in detected_faces]
+            max_size = max(sizes)
+            min_allowed_size = max_size * (min_size_percentage / 100.0)
 
-        # ── ORDER / FILTER ───────────────────────────────────────────────
+            # Get indices of faces that meet the size requirement
+            indices_to_keep = [i for i, size in enumerate(sizes) if size >= min_allowed_size]
+            
+            # Only apply filter if it doesn't remove all faces
+            if indices_to_keep:
+                detected_faces = [detected_faces[i] for i in indices_to_keep]
+                detected_infos = [detected_infos[i] for i in indices_to_keep]
+
+        # ── ORDER / SORT ─────────────────────────────────────────────────────
         if face_filter == "largest_first":
             order = sorted(
                 range(len(detected_faces)),
@@ -193,7 +215,9 @@ class AutoCropFaces:
 
         # ── PREPARE OUTPUT ───────────────────────────────────────────────
         if not faces_sel:
-            return image, None
+            # If selection is empty after all filtering, return the original image
+            fallback = [(0, 0, image.shape[3], image.shape[2])]
+            return image, fallback
         if len(faces_sel) == 1:
             return faces_sel[0], infos_sel[0]
 
